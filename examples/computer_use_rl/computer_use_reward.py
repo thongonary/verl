@@ -70,35 +70,37 @@ def compute_score(
     executed = 0
     try:
         from examples.computer_use_rl.vnc_env import KvmVncEnv, VncAction
+        from examples.computer_use_rl.vnc_lock import vnc_global_lock
 
-        env = KvmVncEnv(
-            host=vnc_host,
-            port=int(vnc_port),
-            resize_hw=(84, 84),
-            step_sleep_s=step_sleep_s,
-            shutdown_reactor_on_close=False,
-        )
-        try:
-            env.reset()
-            for act in actions:
-                act_type = act.get("type")
-                if act_type == "move":
-                    env.step(
-                        VncAction(
-                            kind="move",
-                            dx=int(act.get("dx", 0)),
-                            dy=int(act.get("dy", 0)),
+        with vnc_global_lock(host=vnc_host, port=int(vnc_port)):
+            env = KvmVncEnv(
+                host=vnc_host,
+                port=int(vnc_port),
+                resize_hw=(84, 84),
+                step_sleep_s=step_sleep_s,
+                shutdown_reactor_on_close=False,
+            )
+            try:
+                env.reset()
+                for act in actions:
+                    act_type = act.get("type")
+                    if act_type == "move":
+                        env.step(
+                            VncAction(
+                                kind="move",
+                                dx=int(act.get("dx", 0)),
+                                dy=int(act.get("dy", 0)),
+                            )
                         )
-                    )
-                elif act_type == "click_left":
-                    env.step(VncAction(kind="click_left"))
-                elif act_type == "key":
-                    key = act.get("key")
-                    if isinstance(key, str) and key:
-                        env.step(VncAction(kind="key", key=key))
-                executed += 1
-        finally:
-            env.close()
+                    elif act_type == "click_left":
+                        env.step(VncAction(kind="click_left"))
+                    elif act_type == "key":
+                        key = act.get("key")
+                        if isinstance(key, str) and key:
+                            env.step(VncAction(kind="key", key=key))
+                    executed += 1
+            finally:
+                env.close()
     except Exception as exc:
         return {
             "score": 0.0,

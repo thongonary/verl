@@ -36,7 +36,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.name=$ENGINE \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-  actor_rollout_ref.rollout.n=2 \
+  actor_rollout_ref.rollout.n=1 \
+  actor_rollout_ref.rollout.agent.num_workers=1 \
+  actor_rollout_ref.rollout.agent.default_agent_loop=vnc_single_action_agent \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
   actor_rollout_ref.rollout.free_cache_engine=True \

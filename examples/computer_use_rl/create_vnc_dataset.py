@@ -8,6 +8,7 @@ import datasets
 from PIL import Image
 
 from examples.computer_use_rl.vnc_env import KvmVncEnv
+from examples.computer_use_rl.vnc_lock import vnc_global_lock
 
 
 def _make_prompt(task: str) -> list[dict[str, Any]]:
@@ -20,11 +21,12 @@ def _make_prompt(task: str) -> list[dict[str, Any]]:
                 "You are a computer-use agent. You will be given a screenshot.\n"
                 "Screenshot: <image>\n\n"
                 f"Task: {task}\n\n"
-                "Output ONLY a sequence of actions, one JSON per line.\n"
+                "Output EXACTLY ONE action as a single JSON object (and nothing else).\n"
                 "Allowed actions:\n"
                 "- {\"type\": \"move\", \"dx\": int, \"dy\": int}\n"
                 "- {\"type\": \"click_left\"}\n"
                 "- {\"type\": \"key\", \"key\": string}\n"
+                "- {\"type\": \"done\"}\n"
                 "Do not output any other text."
             ),
         }
@@ -43,16 +45,17 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    env = KvmVncEnv(
-        host=args.vnc_host,
-        port=args.vnc_port,
-        resize_hw=(512, 512),
-        shutdown_reactor_on_close=True,
-    )
-    try:
-        obs = env.reset()  # uint8 HxWx3
-    finally:
-        env.close()
+    with vnc_global_lock(host=args.vnc_host, port=args.vnc_port):
+        env = KvmVncEnv(
+            host=args.vnc_host,
+            port=args.vnc_port,
+            resize_hw=(512, 512),
+            shutdown_reactor_on_close=True,
+        )
+        try:
+            obs = env.reset()  # uint8 HxWx3
+        finally:
+            env.close()
 
     screenshot = Image.fromarray(obs, mode="RGB")
 
