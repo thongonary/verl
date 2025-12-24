@@ -940,9 +940,44 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+        # non_tensor_batch can be inconsistent across different workers / stages.
+        # Be tolerant here: take the union of keys and fill missing entries with
+        # a default array of the correct batch length.
+        non_tensor_keys: set[str] = set()
+        for d in data:
+            non_tensor_keys.update(d.non_tensor_batch.keys())
+
+        non_tensor_batch: dict[str, np.ndarray] = {}
+        for key in non_tensor_keys:
+            exemplar = None
+            for d in data:
+                if key in d.non_tensor_batch:
+                    exemplar = d.non_tensor_batch[key]
+                    break
+
+            if exemplar is None:
+                continue
+
+            assert isinstance(exemplar, np.ndarray)
+            tail_shape = exemplar.shape[1:]
+            dtype = exemplar.dtype
+
+            parts: list[np.ndarray] = []
+            for d in data:
+                if key in d.non_tensor_batch:
+                    arr = d.non_tensor_batch[key]
+                    assert isinstance(arr, np.ndarray)
+                    parts.append(arr)
+                else:
+                    fill_shape = (len(d), *tail_shape)
+                    if dtype == object:
+                        filler = np.empty(fill_shape, dtype=object)
+                        filler[...] = None
+                    else:
+                        filler = np.zeros(fill_shape, dtype=dtype)
+                    parts.append(filler)
+
+            non_tensor_batch[key] = np.concatenate(parts, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
