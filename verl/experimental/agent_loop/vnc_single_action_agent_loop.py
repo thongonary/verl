@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +14,25 @@ from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _safe_filename(s: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in s)[:180]
+
+
+def _maybe_get_cfg_str(config: Any, key_path: str) -> str | None:
+    """Best-effort OmegaConf-style path lookup without hard dependency."""
+    try:
+        from omegaconf import OmegaConf
+
+        value = OmegaConf.select(config, key_path)
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+    except Exception:
+        return None
 
 
 def _extract_action_dict(text: str) -> dict[str, Any] | None:
@@ -73,6 +93,14 @@ class VncSingleActionAgentLoop(AgentLoopBase):
         self.vnc_port = int(reward_kwargs.get("vnc_port", 5901))
         self.max_actions = int(reward_kwargs.get("max_actions", 8))
 
+        # Optional trajectory dumping for debugging.
+        # Enable by setting VERL_TRAJECTORY_DUMP_DIR or hydra override:
+        #   +actor_rollout_ref.rollout.agent.trajectory_dump_dir=/path
+        self.trajectory_dump_dir = (
+            os.getenv("VERL_TRAJECTORY_DUMP_DIR")
+            or _maybe_get_cfg_str(self.config, "actor_rollout_ref.rollout.agent.trajectory_dump_dir")
+        )
+
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Import lazily so training without VNC deps still works.
         from examples.computer_use_rl.vnc_env import KvmVncEnv, VncAction
@@ -83,6 +111,23 @@ class VncSingleActionAgentLoop(AgentLoopBase):
 
         metrics: dict[str, Any] = {}
         request_id = uuid4().hex
+
+        trajectory = kwargs.get("trajectory") or {}
+        global_step = trajectory.get("step", -1)
+        sample_index = trajectory.get("sample_index", -1)
+        rollout_n = trajectory.get("rollout_n", -1)
+        validate = bool(trajectory.get("validate", False))
+
+        dump_root: Path | None = None
+        if self.trajectory_dump_dir:
+            # Each rollout gets its own directory to avoid collisions across workers.
+            exp_name = _maybe_get_cfg_str(self.config, "trainer.experiment_name") or "experiment"
+            run_name = f"step_{global_step}_sample_{sample_index}_rollout_{rollout_n}_req_{request_id}"
+            run_name = _safe_filename(run_name)
+            dump_root = Path(self.trajectory_dump_dir).expanduser().resolve() / _safe_filename(exp_name) / run_name
+            dump_root.mkdir(parents=True, exist_ok=True)
+
+        trace_events: list[dict[str, Any]] = []
 
         env = KvmVncEnv(
             host=self.vnc_host,
@@ -102,6 +147,9 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                 # Sync the first screenshot with the live env.
                 obs0 = env.reset()
                 img0 = Image.fromarray(obs0, mode="RGB")
+
+                if dump_root is not None:
+                    img0.save(dump_root / "screen_000_reset.png")
 
                 if image_data is None:
                     image_data = [img0]
@@ -188,8 +236,20 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                     decoded = await self.loop.run_in_executor(
                         None, lambda: self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                     )
+
+                    if dump_root is not None:
+                        (dump_root / f"model_output_{num_actions:03d}.txt").write_text(decoded, encoding="utf-8")
+
                     action_dict = _extract_action_dict(decoded)
                     if not action_dict:
+                        trace_events.append(
+                            {
+                                "turn": num_actions,
+                                "parsed": False,
+                                "decoded": decoded,
+                                "reason": "parse_failed",
+                            }
+                        )
                         # Can't parse -> terminate to avoid spinning
                         break
 
@@ -198,6 +258,15 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                         action_type = action_type.strip().lower()
 
                     if action_type in ("done", "finish", "stop"):
+                        trace_events.append(
+                            {
+                                "turn": num_actions,
+                                "parsed": True,
+                                "action": action_dict,
+                                "action_type": action_type,
+                                "terminated": True,
+                            }
+                        )
                         break
 
                     # Execute env step
@@ -214,10 +283,31 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                         vnc_action = VncAction(kind="key", key=key)
                     else:
                         # Unknown action -> terminate
+                        trace_events.append(
+                            {
+                                "turn": num_actions,
+                                "parsed": True,
+                                "action": action_dict,
+                                "action_type": action_type,
+                                "reason": "unknown_action",
+                            }
+                        )
                         break
+
+                    trace_events.append(
+                        {
+                            "turn": num_actions,
+                            "parsed": True,
+                            "action": action_dict,
+                            "action_type": action_type,
+                        }
+                    )
 
                     obs = env.step(vnc_action)
                     new_img = Image.fromarray(obs, mode="RGB")
+
+                    if dump_root is not None:
+                        new_img.save(dump_root / f"screen_{num_actions + 1:03d}_after.png")
 
                     # Append user observation turn with a new image placeholder
                     obs_message = {
@@ -245,6 +335,24 @@ class VncSingleActionAgentLoop(AgentLoopBase):
             env.close()
 
         multi_modal_out = {"image": image_data} if image_data is not None else {}
+
+        if dump_root is not None:
+            summary = {
+                "trajectory": {
+                    "global_step": global_step,
+                    "sample_index": sample_index,
+                    "rollout_n": rollout_n,
+                    "validate": validate,
+                    "request_id": request_id,
+                },
+                "vnc": {"host": self.vnc_host, "port": self.vnc_port, "max_actions": self.max_actions},
+                "events": trace_events,
+                "metrics": metrics,
+                "num_messages": len(messages),
+                "final_num_images": len(image_data) if isinstance(image_data, list) else (1 if image_data else 0),
+                "messages": messages,
+            }
+            (dump_root / "trajectory.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
         return AgentLoopOutput(
             prompt_ids=prompt_ids,

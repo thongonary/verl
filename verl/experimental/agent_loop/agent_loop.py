@@ -410,7 +410,8 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            # Provide rollout metadata to agent loops (useful for debugging / trajectory dumps).
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, trajectory=trajectory, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:

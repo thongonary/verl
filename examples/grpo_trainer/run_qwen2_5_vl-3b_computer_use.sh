@@ -4,6 +4,11 @@ set -x
 
 ENGINE=${1:-vllm}
 
+# Optional: dump per-rollout trajectories (screenshots + actions) for debugging.
+# Example:
+#   VERL_TRAJECTORY_DUMP_DIR=$HOME/trl_dumps \
+#   bash ./examples/grpo_trainer/run_qwen2_5_vl-3b_computer_use.sh
+
 # 1) Create a tiny dataset from the current VNC screen (4 train rows / 1 val row)
 python -m examples.computer_use_rl.create_vnc_dataset \
   --vnc-host 127.0.0.1 \
