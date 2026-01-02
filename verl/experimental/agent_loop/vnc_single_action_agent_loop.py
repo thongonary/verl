@@ -78,6 +78,95 @@ def _extract_action_dict(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_text_from_message(message: Any) -> str | None:
+    """Extract concatenated text from a chat message.
+
+    Supports HF-style messages where `content` can be a string or a list of
+    multimodal items like {"type": "text", "text": "..."}.
+    """
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        s = content.strip()
+        return s if s else None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                t = item.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+        s = "".join(parts).strip()
+        return s if s else None
+    return None
+
+
+def _extract_initial_instruction(messages: list[Any]) -> str | None:
+    """Best-effort extraction of the original user instruction/task."""
+    if not messages:
+        return None
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _extract_text_from_message(msg)
+            if text:
+                return text
+    return None
+
+
+def _extract_thinking(decoded_text: str) -> dict[str, Any] | None:
+    """Extract explicit model 'thinking' blocks if present.
+
+    This does not attempt to infer hidden chain-of-thought; it only captures
+    text that the model explicitly emitted (e.g., <think>...</think> or a
+    ```think fenced block).
+    """
+    if not decoded_text or not isinstance(decoded_text, str):
+        return None
+
+    s = decoded_text
+    # Common explicit tags
+    if "<think>" in s and "</think>" in s:
+        start = s.find("<think>") + len("<think>")
+        end = s.find("</think>", start)
+        if end > start:
+            think_text = s[start:end].strip()
+            # Remove the thinking block from the visible output
+            remainder = (s[: s.find("<think>")] + s[end + len("</think>") :]).strip()
+            return {
+                "present": True,
+                "format": "tag",
+                "thinking_text": think_text,
+                "output_without_thinking": remainder,
+            }
+
+    # Fenced block ```think ... ```
+    fence = "```"
+    idx = s.find(fence)
+    while idx != -1:
+        end_fence = s.find(fence, idx + len(fence))
+        if end_fence == -1:
+            break
+        header = s[idx + len(fence) :].lstrip()
+        if header.startswith("think"):
+            body_start = idx + len(fence) + header.find("think") + len("think")
+            # Skip optional newline
+            if body_start < len(s) and s[body_start] == "\n":
+                body_start += 1
+            think_text = s[body_start:end_fence].strip()
+            remainder = (s[:idx] + s[end_fence + len(fence) :]).strip()
+            return {
+                "present": True,
+                "format": "fence",
+                "thinking_text": think_text,
+                "output_without_thinking": remainder,
+            }
+        idx = s.find(fence, end_fence + len(fence))
+
+    # No explicit thinking
+    return {"present": False}
+
+
 @register("vnc_single_action_agent")
 class VncSingleActionAgentLoop(AgentLoopBase):
     """Closed-loop VNC agent: generate exactly one action, execute it, add new screenshot, repeat."""
@@ -108,6 +197,8 @@ class VncSingleActionAgentLoop(AgentLoopBase):
 
         messages = list(kwargs["raw_prompt"])
         image_data = copy.deepcopy((kwargs.get("multi_modal_data") or {}).get("image", None))
+
+        original_instruction = _extract_initial_instruction(messages)
 
         metrics: dict[str, Any] = {}
         request_id = uuid4().hex
@@ -240,13 +331,22 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                     if dump_root is not None:
                         (dump_root / f"model_output_{num_actions:03d}.txt").write_text(decoded, encoding="utf-8")
 
-                    action_dict = _extract_action_dict(decoded)
+                    thinking = _extract_thinking(decoded)
+
+                    # Prefer parsing actions from output without explicit thinking blocks (if present)
+                    action_parse_text = (
+                        thinking.get("output_without_thinking")
+                        if isinstance(thinking, dict) and thinking.get("present") and thinking.get("output_without_thinking")
+                        else decoded
+                    )
+                    action_dict = _extract_action_dict(action_parse_text)
                     if not action_dict:
                         trace_events.append(
                             {
                                 "turn": num_actions,
                                 "parsed": False,
                                 "decoded": decoded,
+                                "thinking": thinking,
                                 "reason": "parse_failed",
                             }
                         )
@@ -264,6 +364,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                                 "parsed": True,
                                 "action": action_dict,
                                 "action_type": action_type,
+                                "thinking": thinking,
                                 "terminated": True,
                             }
                         )
@@ -289,6 +390,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                                 "parsed": True,
                                 "action": action_dict,
                                 "action_type": action_type,
+                                "thinking": thinking,
                                 "reason": "unknown_action",
                             }
                         )
@@ -300,6 +402,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                             "parsed": True,
                             "action": action_dict,
                             "action_type": action_type,
+                            "thinking": thinking,
                         }
                     )
 
@@ -309,25 +412,18 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                     if dump_root is not None:
                         new_img.save(dump_root / f"screen_{num_actions + 1:03d}_after.png")
 
-                    # Append user observation turn with a new image placeholder
-                    obs_message = {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Observation screenshot: "},
-                            {"type": "image"},
-                            {
-                                "type": "text",
-                                "text": "\nReturn exactly ONE action as a JSON object. If the task is complete, return {\"type\": \"done\"}.",
-                            },
-                        ],
-                    }
-                    messages.append(obs_message)
+                    # IMPORTANT: do NOT keep appending image placeholders each turn.
+                    # For Qwen2-VL, each image adds a large number of tokens; appending one image
+                    # per step quickly exceeds vLLM max_model_len and crashes with negative max_tokens.
+                    # Instead, replace the latest screenshot image in-place.
                     if image_data is None:
                         image_data = [new_img]
                     elif not isinstance(image_data, list):
-                        image_data = [image_data, new_img]
+                        image_data = [new_img]
+                    elif len(image_data) == 0:
+                        image_data = [new_img]
                     else:
-                        image_data.append(new_img)
+                        image_data[-1] = new_img
 
                     num_actions += 1
 
@@ -345,6 +441,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
                     "validate": validate,
                     "request_id": request_id,
                 },
+                "original_instruction": original_instruction,
                 "vnc": {"host": self.vnc_host, "port": self.vnc_port, "max_actions": self.max_actions},
                 "events": trace_events,
                 "metrics": metrics,
@@ -360,6 +457,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             multi_modal_data=multi_modal_out,
-            num_turns=2 + len(messages),
+            # Keep this roughly consistent as "steps" for metrics. Messages no longer grow per step.
+            num_turns=2 + num_actions,
             metrics=metrics,
         )

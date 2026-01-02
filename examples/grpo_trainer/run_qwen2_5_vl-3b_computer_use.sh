@@ -4,10 +4,10 @@ set -x
 
 ENGINE=${1:-vllm}
 
+
 # Optional: dump per-rollout trajectories (screenshots + actions) for debugging.
 # Example:
-#   VERL_TRAJECTORY_DUMP_DIR=$HOME/trl_dumps \
-#   bash ./examples/grpo_trainer/run_qwen2_5_vl-3b_computer_use.sh
+#   VERL_TRAJECTORY_DUMP_DIR=$HOME/trl_dumps bash ./examples/grpo_trainer/run_qwen2_5_vl-3b_computer_use.sh
 
 # 1) Create a tiny dataset from the current VNC screen (4 train rows / 1 val row)
 python -m examples.computer_use_rl.create_vnc_dataset \
@@ -26,7 +26,7 @@ python3 -m verl.trainer.main_ppo \
   data.train_files=$HOME/data/computer_use_dummy/train.parquet \
   data.val_files=$HOME/data/computer_use_dummy/test.parquet \
   data.train_batch_size=4 \
-  data.max_prompt_length=1024 \
+  data.max_prompt_length=2048 \
   data.max_response_length=512 \
   data.filter_overlong_prompts=True \
   data.truncation='error' \
@@ -40,6 +40,8 @@ python3 -m verl.trainer.main_ppo \
   algorithm.use_kl_in_reward=False \
   actor_rollout_ref.rollout.name=$ENGINE \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+  actor_rollout_ref.rollout.prompt_length=2048 \
+  actor_rollout_ref.rollout.response_length=512 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.agent.num_workers=1 \
