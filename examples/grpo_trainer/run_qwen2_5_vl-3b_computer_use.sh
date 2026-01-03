@@ -2,7 +2,35 @@
 set -euo pipefail
 set -x
 
-ENGINE=${1:-vllm}
+# Optional first positional arg selects the rollout engine (default: vllm).
+# We must shift it out so it is not forwarded to Hydra as an override.
+if [[ $# -gt 0 ]]; then
+  ENGINE="$1"
+  shift
+else
+  ENGINE=vllm
+fi
+
+# Optional: make first-iteration debugging much faster.
+# - disables torch.compile in actor/ref FSDP
+# - disables vLLM CUDA graph capture (enforce eager)
+# Usage:
+#   FAST_DEBUG=1 bash ./examples/grpo_trainer/run_qwen2_5_vl-3b_computer_use.sh
+FAST_DEBUG=${FAST_DEBUG:-1}
+
+# Default to dumping trajectories into $HOME/trl_dumps/<run_id>/... so reruns are easy to inspect.
+# You can always override these by setting env vars before running the script.
+VERL_TRAJECTORY_DUMP_DIR=${VERL_TRAJECTORY_DUMP_DIR:-$HOME/trl_dumps}
+VERL_RUN_ID=${VERL_RUN_ID:-run1}
+export VERL_TRAJECTORY_DUMP_DIR VERL_RUN_ID
+
+# Optional: if VERL_TRAJECTORY_DUMP_DIR is set, create a per-run subdirectory so runs don't mix.
+# The agent loop will still create per-rollout subdirs underneath.
+if [[ -n "${VERL_TRAJECTORY_DUMP_DIR:-}" ]]; then
+  RUN_ID=${VERL_RUN_ID:-$(date +%Y%m%d_%H%M%S)}
+  export VERL_TRAJECTORY_DUMP_DIR="${VERL_TRAJECTORY_DUMP_DIR%/}/${RUN_ID}"
+  echo "[computer_use] VERL_TRAJECTORY_DUMP_DIR=${VERL_TRAJECTORY_DUMP_DIR}"
+fi
 
 
 # Optional: dump per-rollout trajectories (screenshots + actions) for debugging.
@@ -19,6 +47,22 @@ python -m examples.computer_use_rl.create_vnc_dataset \
   --task "(dummy) Move cursor / click / press enter"
 
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+
+EXTRA_ARGS=()
+if [[ "$FAST_DEBUG" == "1" ]]; then
+  # A belt-and-suspenders global kill switch: even if some component still tries
+  # to enable torch.compile, TorchDynamo will be disabled.
+  export TORCHDYNAMO_DISABLE=1
+
+  EXTRA_ARGS+=(
+    actor_rollout_ref.rollout.enforce_eager=True
+    actor_rollout_ref.actor.use_torch_compile=False
+    actor_rollout_ref.actor.fsdp_config.use_torch_compile=False
+    actor_rollout_ref.ref.use_torch_compile=False
+    actor_rollout_ref.ref.fsdp_config.use_torch_compile=False
+  )
+  echo "[computer_use] FAST_DEBUG=1 (enforce_eager + disable torch.compile)"
+fi
 
 # 2) Run GRPO with Qwen2.5-VL-3B on 4 GPUs
 python3 -m verl.trainer.main_ppo \
@@ -60,9 +104,11 @@ python3 -m verl.trainer.main_ppo \
   trainer.logger='["console"]' \
   trainer.project_name='computer_use_grpo' \
   trainer.experiment_name='qwen2_5_vl_3b_vnc_dummy' \
+  trainer.resume_mode=disable \
   trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
   trainer.total_epochs=1 \
   trainer.save_freq=999999 \
   trainer.test_freq=1 \
+  "${EXTRA_ARGS[@]}" \
   $@

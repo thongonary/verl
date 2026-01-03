@@ -224,7 +224,7 @@ class VncSingleActionAgentLoop(AgentLoopBase):
             host=self.vnc_host,
             port=self.vnc_port,
             resize_hw=(512, 512),
-            shutdown_reactor_on_close=True,
+            shutdown_reactor_on_close=False,
         )
 
         response_ids: list[int] = []
