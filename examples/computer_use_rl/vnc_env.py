@@ -117,13 +117,40 @@ class KvmVncEnv:
         elif action.kind == "key":
             if not action.key:
                 raise ValueError("key action requires action.key")
-            self._client.keyPress(action.key)
+            self._press_key(action.key)
         else:
             raise ValueError(f"Unknown action kind: {action.kind}")
 
         if self.step_sleep_s > 0:
             time.sleep(self.step_sleep_s)
         return self._capture_obs()
+
+    def _press_key(self, key: str) -> None:
+        """Press a key or type text.
+
+        vncdotool accepts either:
+        - a single character, e.g. "a"
+        - a named keysym in vncdotool.client.KEYMAP, e.g. "enter", "esc", "left"
+
+        Model outputs often contain "Enter" / "Backspace" / "Escape" etc.
+        We normalize common synonyms and fall back to typing the string.
+        """
+
+        raw = str(key)
+        normalized = _normalize_vnc_key(raw)
+        if normalized is None:
+            # Fallback: treat as literal text; type character-by-character.
+            for ch in raw:
+                if ch == "\n":
+                    self._client.keyPress("enter")
+                elif ch == "\t":
+                    self._client.keyPress("tab")
+                else:
+                    self._client.keyPress(ch)
+            return
+
+        # vncdotool supports chords like "ctrl+c" as "ctrl+c" (with '+').
+        self._client.keyPress(normalized)
 
     def _apply_mouse_move(self, dx: int, dy: int) -> None:
         assert self._cursor_xy is not None
@@ -148,3 +175,71 @@ class KvmVncEnv:
             img = img.resize((w, h), resample=Image.BILINEAR)
         obs = np.asarray(img, dtype=np.uint8)
         return obs
+
+
+def _normalize_vnc_key(key: str) -> Optional[str]:
+    """Normalize a user/model key string into a vncdotool keysym.
+
+    Returns None if it should be treated as literal text.
+    """
+
+    from vncdotool.client import KEYMAP
+
+    s = key.strip()
+    if not s:
+        return None
+
+    # Common separators for key chords.
+    sep = None
+    for candidate in ("+", "-"):
+        if candidate in s:
+            sep = candidate
+            break
+
+    parts = [s] if sep is None else [p for p in s.split(sep) if p]
+    normalized_parts: list[str] = []
+
+    for part in parts:
+        p = part.strip().lower()
+        if not p:
+            continue
+
+        # Synonyms / normalization.
+        alias = {
+            "escape": "esc",
+            "esc": "esc",
+            "return": "enter",
+            "kpenter": "enter",
+            "backspace": "bsp",
+            "bksp": "bsp",
+            "bs": "bsp",
+            "spacebar": "space",
+            "space": "space",
+            "delete": "delete",
+            "del": "delete",
+            "control": "ctrl",
+            "cmd": "meta",
+            "command": "meta",
+            "option": "alt",
+            "pageup": "pgup",
+            "pagedown": "pgdn",
+        }.get(p, p)
+
+        # Single characters are fine.
+        if len(alias) == 1:
+            normalized_parts.append(alias)
+            continue
+
+        # Named keysyms must exist in KEYMAP.
+        if alias in KEYMAP:
+            normalized_parts.append(alias)
+            continue
+
+        # Unknown multi-character key: treat as literal text.
+        return None
+
+    if not normalized_parts:
+        return None
+
+    joiner = "+" if sep is None else "+"
+    return joiner.join(normalized_parts)

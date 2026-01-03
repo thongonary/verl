@@ -21,7 +21,7 @@ FAST_DEBUG=${FAST_DEBUG:-1}
 # Default to dumping trajectories into $HOME/trl_dumps/<run_id>/... so reruns are easy to inspect.
 # You can always override these by setting env vars before running the script.
 VERL_TRAJECTORY_DUMP_DIR=${VERL_TRAJECTORY_DUMP_DIR:-$HOME/trl_dumps}
-VERL_RUN_ID=${VERL_RUN_ID:-run1}
+VERL_RUN_ID=${VERL_RUN_ID:-run_$(date +%Y%m%d_%H%M%S)}
 export VERL_TRAJECTORY_DUMP_DIR VERL_RUN_ID
 
 # Optional: if VERL_TRAJECTORY_DUMP_DIR is set, create a per-run subdirectory so runs don't mix.
